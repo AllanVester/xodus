@@ -68,6 +68,41 @@ pub async fn refresh_tokens(
     Ok(ts)
 }
 
+/// Load the proof key this service should mint with, from XODUS_PROOF_KEY.
+///
+/// WHY. An XSTS token is bound to the proof key advertised when it was minted,
+/// and only the holder of that key can sign requests carrying the token. When a
+/// caller asks this service for a title-scoped token but signs its own requests,
+/// the two must be the same key - otherwise every signed Xbox Live call goes out
+/// unsigned (or wrongly signed) and services that check it refuse the caller.
+///
+/// Format: three lines of 64 lowercase hex chars - x, y, d - the same file the
+/// caller reads. Only `d` is needed to rebuild the keypair; x and y are present
+/// so one file describes the whole key and can be checked by eye.
+/// Unset or unreadable => None, and a key is generated as before.
+fn host_request_signer() -> Option<xal::RequestSigner> {
+    let path = std::env::var("XODUS_PROOF_KEY").ok()?;
+    let text = std::fs::read_to_string(&path)
+        .inspect_err(|e| log::warn!("XODUS_PROOF_KEY {path}: {e}"))
+        .ok()?;
+    let d = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .nth(2)?;
+    let bytes = (0..d.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&d[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .inspect_err(|_| log::warn!("XODUS_PROOF_KEY: line 3 is not hex"))
+        .ok()?;
+    let key = xal::SecretKey::from_slice(&bytes)
+        .inspect_err(|e| log::warn!("XODUS_PROOF_KEY: not a valid P-256 scalar: {e}"))
+        .ok()?;
+    log::info!("using host-supplied proof key from {path}");
+    Some(xal::RequestSigner::with_keypair(key))
+}
+
 pub async fn do_sisu(
     client: &Client,
     manager: &TokenManager,
@@ -176,6 +211,12 @@ pub async fn do_sisu(
         },
         "RETAIL".to_owned(),
     );
+
+    // Before any token is requested: the device token and the XSTS request both
+    // embed the proof key, so it has to be settled first.
+    if let Some(signer) = host_request_signer() {
+        auth.set_request_signer(signer);
+    }
 
     let data = auth
         .get_device_token_rps(ms_device_token.to_owned())
