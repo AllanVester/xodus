@@ -10,3 +10,10 @@ base64 = { version = "0.22.1" }
 
 [patch.crates-io]
 ntfs = { git = "https://github.com/xodus-gaming/ntfs.git" }
+
+# Local xal with `RequestSigner::with_keypair` / `XalAuthenticator::set_request_signer`,
+# so this service can mint XSTS tokens bound to a proof key the CALLER holds. Without
+# it the caller cannot sign requests carrying a token minted here, and every signed
+# Xbox Live call goes out unsigned. Same rev as the git dependency, plus that patch.
+[patch."https://github.com/xodus-gaming/xal-rs"]
+xal = { path = "../xal-rs-patched" }
