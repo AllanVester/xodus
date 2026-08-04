@@ -47,3 +47,19 @@ pub struct XstsTokenResponse {
     pub xuid: String,
     pub expiry: i64,
 }
+
+/// The proof key the service mints with, handed to a caller that signs its own
+/// requests with tokens minted here.
+///
+/// x, y and d are 64 lowercase hex chars each - the field order and width of a
+/// Windows BCRYPT_ECCPRIVATE_BLOB, so the caller can import it without
+/// rearranging anything. d is a PRIVATE key; it goes over a unix socket that
+/// only this user can open, which is the same trust boundary the token store
+/// already relies on.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ProofKeyResponse {
+    pub x: String,
+    pub y: String,
+    pub d: String,
+}

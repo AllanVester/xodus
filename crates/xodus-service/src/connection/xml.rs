@@ -4,7 +4,10 @@ use xodus::{
         live::ExchangeUserTokenOutcome,
         secrets::Token,
         soap,
-        xgameruntime::xuser::{MSATokenRequest, MSATokenResponse, XstsTokenRequest, XstsTokenResponse},
+        xgameruntime::xuser::{
+            MSATokenRequest, MSATokenResponse, ProofKeyResponse, XstsTokenRequest,
+            XstsTokenResponse,
+        },
     },
     proto::xodus::XodusMessageType,
 };
@@ -43,6 +46,16 @@ pub async fn parse_message(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     match message_type {
         XodusMessageType::Ping => Ok(buffer),
+        // The proof key we mint with. The caller signs its own requests with the
+        // tokens we mint, so it needs the key those tokens are bound to; handing
+        // it over here is what lets both sides run unconfigured.
+        XodusMessageType::ProofKeyRequest => {
+            let (x, y, d) = xodus::auth::service_proof_key_xyd()
+                .ok_or_else(|| std::io::Error::other("no proof key available"))?;
+            log::debug!("proof key requested, serving x={}...", &x[..16]);
+            let payload = ProofKeyResponse { x, y, d };
+            Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec())
+        }
         // An XSTS carrying the TITLE claim, for one relying party.
         //
         // This is minted here rather than by the caller because the three tokens

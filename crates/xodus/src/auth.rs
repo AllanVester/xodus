@@ -81,23 +81,88 @@ pub async fn refresh_tokens(
 /// GDK side reads. Only `d` is needed to rebuild the keypair; x and y are
 /// present so one file describes the whole key and can be checked by eye.
 /// Unset or unreadable => None, and a key is generated as before.
-fn host_request_signer() -> Option<xal::RequestSigner> {
-    let path = std::env::var("XODUS_PROOF_KEY").ok()?;
-    let text = std::fs::read_to_string(&path)
-        .inspect_err(|e| log::warn!("XODUS_PROOF_KEY {path}: {e}"))
-        .ok()?;
+/// Keychain entry holding the proof key, alongside the token store's entries.
+const PROOF_KEY_ENTRY: &str = "proof_key";
+
+fn key_from_hex_line(text: &str, what: &str) -> Option<xal::SecretKey> {
     let d = text.lines().map(str::trim).filter(|l| !l.is_empty()).nth(2)?;
     let bytes = (0..d.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&d[i..i + 2], 16))
         .collect::<Result<Vec<u8>, _>>()
-        .inspect_err(|_| log::warn!("XODUS_PROOF_KEY: line 3 is not hex"))
+        .inspect_err(|_| log::warn!("{what}: line 3 is not hex"))
         .ok()?;
-    let key = xal::SecretKey::from_slice(&bytes)
-        .inspect_err(|e| log::warn!("XODUS_PROOF_KEY: not a valid P-256 scalar: {e}"))
+    xal::SecretKey::from_slice(&bytes)
+        .inspect_err(|e| log::warn!("{what}: not a valid P-256 scalar: {e}"))
+        .ok()
+}
+
+/// The proof key this service mints tokens with.
+///
+/// WHY IT LIVES HERE. A token is bound to the proof key advertised when it was
+/// minted, and only the holder of that key can sign requests carrying it. When a
+/// caller has us mint but signs for itself, the two must be the same key. It has
+/// to be OUR key rather than the caller's, because device credentials are minted
+/// at startup - before any caller has connected to offer one - and those are
+/// bound to it too.
+///
+/// So it is generated once and kept in the keychain next to the token store. A
+/// caller asks for it over the IPC socket (PROOF_KEY_REQUEST), which means
+/// neither side needs configuring and the two cannot disagree.
+///
+/// XODUS_PROOF_KEY still overrides, naming a file of three hex lines - x, y, d -
+/// for the case where a DeviceToken already exists that was minted against a
+/// specific key, which a freshly generated one would not match.
+pub fn service_proof_key() -> Option<xal::SecretKey> {
+    if let Ok(path) = std::env::var("XODUS_PROOF_KEY") {
+        let text = std::fs::read_to_string(&path)
+            .inspect_err(|e| log::warn!("XODUS_PROOF_KEY {path}: {e}"))
+            .ok()?;
+        log::info!("using host-supplied proof key from {path}");
+        return key_from_hex_line(&text, "XODUS_PROOF_KEY");
+    }
+
+    let entry = crate::secrets::get_entry(PROOF_KEY_ENTRY)
+        .inspect_err(|e| log::warn!("proof key: no keychain entry: {e}"))
         .ok()?;
-    log::info!("using host-supplied proof key from {path}");
-    Some(xal::RequestSigner::with_keypair(key))
+
+    match entry.get_secret() {
+        Ok(bytes) => xal::SecretKey::from_slice(&bytes)
+            .inspect_err(|e| log::warn!("stored proof key is unusable: {e}"))
+            .ok(),
+        Err(keyring_core::Error::NoEntry) => {
+            let key = xal::SecretKey::random(&mut rand08::rngs::OsRng);
+            entry
+                .set_secret(&key.to_bytes())
+                .inspect_err(|e| log::warn!("could not store the proof key: {e}"))
+                .ok()?;
+            log::info!("generated a proof key and stored it in the keychain");
+            Some(key)
+        }
+        Err(e) => {
+            log::warn!("proof key: keychain read failed: {e}");
+            None
+        }
+    }
+}
+
+/// The same key as x, y, d - 64 lowercase hex chars each, the field order and
+/// width of a Windows BCRYPT_ECCPRIVATE_BLOB, so a caller can import it whole.
+pub fn service_proof_key_xyd() -> Option<(String, String, String)> {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let key = service_proof_key()?;
+    let point = key.public_key().to_encoded_point(false);
+    let hex = |b: &[u8]| b.iter().map(|c| format!("{c:02x}")).collect::<String>();
+    Some((
+        hex(point.x()?),
+        hex(point.y()?),
+        hex(&key.to_bytes()),
+    ))
+}
+
+fn host_request_signer() -> Option<xal::RequestSigner> {
+    service_proof_key().map(xal::RequestSigner::with_keypair)
 }
 
 pub async fn do_sisu(
