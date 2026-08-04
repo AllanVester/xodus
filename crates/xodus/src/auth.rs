@@ -68,6 +68,38 @@ pub async fn refresh_tokens(
     Ok(ts)
 }
 
+
+/// Load the proof key this service should mint with, from XODUS_PROOF_KEY.
+///
+/// WHY. An XSTS token is bound to the proof key advertised when it was minted,
+/// and only the holder of that key can sign requests carrying the token. When a
+/// GDK asks this service for a title-scoped token but signs its own requests,
+/// the two must be the same key - otherwise every signed Xbox Live call goes out
+/// unsigned (or wrongly signed) and services that check it refuse the caller.
+///
+/// Format: three lines of 64 lowercase hex chars - x, y, d - the same file the
+/// GDK side reads. Only `d` is needed to rebuild the keypair; x and y are
+/// present so one file describes the whole key and can be checked by eye.
+/// Unset or unreadable => None, and a key is generated as before.
+fn host_request_signer() -> Option<xal::RequestSigner> {
+    let path = std::env::var("XODUS_PROOF_KEY").ok()?;
+    let text = std::fs::read_to_string(&path)
+        .inspect_err(|e| log::warn!("XODUS_PROOF_KEY {path}: {e}"))
+        .ok()?;
+    let d = text.lines().map(str::trim).filter(|l| !l.is_empty()).nth(2)?;
+    let bytes = (0..d.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&d[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .inspect_err(|_| log::warn!("XODUS_PROOF_KEY: line 3 is not hex"))
+        .ok()?;
+    let key = xal::SecretKey::from_slice(&bytes)
+        .inspect_err(|e| log::warn!("XODUS_PROOF_KEY: not a valid P-256 scalar: {e}"))
+        .ok()?;
+    log::info!("using host-supplied proof key from {path}");
+    Some(xal::RequestSigner::with_keypair(key))
+}
+
 pub async fn do_sisu(
     client: &Client,
     manager: &TokenManager,
@@ -77,6 +109,10 @@ pub async fn do_sisu(
     (
         XalAuthenticator,
         xal::response::SisuRPSAuthorizationResponse,
+        // The device token SISU was authorized with. The title token it returns is
+        // bound to THIS device, so an XSTS request that pairs the title token with
+        // any other device token is describing two different machines - which is
+        // what `title_usage_by_device_exceeded` appears to be complaining about.
         xal::response::DeviceToken,
     ),
     Box<dyn std::error::Error>,
@@ -177,6 +213,12 @@ pub async fn do_sisu(
         "RETAIL".to_owned(),
     );
 
+    // Before any token is requested: the device token and the XSTS request both
+    // embed the proof key, so it has to be settled first.
+    if let Some(signer) = host_request_signer() {
+        auth.set_request_signer(signer);
+    }
+
     let data = auth
         .get_device_token_rps(ms_device_token.to_owned())
         .await?;
@@ -201,4 +243,208 @@ async fn test_minecraft_win_auth() {
     println!("title {}", resp.title_token.token);
     println!("user {}", resp.user_token.token);
     println!("webpage {}", resp.web_page);
+}
+
+/// Does SISU issue a TITLE TOKEN for Forza Motorsport's own MSA AppId?
+///
+/// This is the whole remaining question for FM on Linux. Its Logon to
+/// gameservices.fm.forzamotorsport.net returns a blank 403, and that endpoint is
+/// credential-opaque - it answers identically for a valid token, a junk token and
+/// no token at all - so the client cannot learn anything from it. The one
+/// measured difference from a working Windows boot is that Windows gets a
+/// different uhs per relying party, which is the signature of a TITLE claim, and
+/// neither Xodus's IPC nor WineGDK's IUser can produce one today.
+///
+/// Before either is worth implementing, Microsoft has to be willing to issue the
+/// token at all. An earlier probe of the CLASSIC route
+/// (title.auth.xboxlive.com/title/authenticate, with a self-minted device token)
+/// returned 403 for this AppId with the request shape exhausted by differential
+/// testing. SISU is a DIFFERENT route and is the one a real GDK uses - and it is
+/// the one this crate already implements and the author has working for Minecraft
+/// - so it deserves its own answer rather than an assumption.
+///
+/// FM: MSAAppId 000000004CC9D265, TitleId 0x6DD4E56D = 1842668909.
+#[ignore]
+#[tokio::test]
+async fn test_forza_motorsport_sisu() {
+    let client = reqwest::Client::new();
+    crate::secrets::init_secrets().expect("Unable to initialize credentials");
+    let tokens = TokenManager::with_keychain_and_memory();
+
+    match do_sisu(&client, &tokens, "000000004CC9D265", 1842668909).await {
+        Ok((_, resp, _)) => {
+            println!("FM-SISU: OK");
+            println!("FM-SISU: title token len {}", resp.title_token.token.len());
+            println!("FM-SISU: user  token len {}", resp.user_token.token.len());
+        }
+        Err(e) => println!("FM-SISU: REFUSED: {e:?}"),
+    }
+}
+
+/// Follow the SISU title token through to an XSTS for FORZA'S relying party, and
+/// write the finished `XBL3.0 x=<uhs>;<token>` header out so it can be replayed
+/// against the real Logon endpoint. This is the end-to-end test of the title
+/// claim WITHOUT touching the game or writing any IPC plumbing: if the replay
+/// stops returning 403, the plumbing is worth building; if it does not, nothing
+/// was lost.
+///
+/// The measured tell to look for is the USERHASH: Windows gets a different uhs
+/// for the Forza relying party than for xboxlive.com in the same boot, while
+/// every token we have minted so far (UserToken alone, and UserToken+DeviceToken)
+/// has produced one uniform uhs across every relying party.
+#[ignore]
+#[tokio::test]
+async fn test_forza_xsts_with_title_token() {
+    let client = reqwest::Client::new();
+    crate::secrets::init_secrets().expect("Unable to initialize credentials");
+    let tokens = TokenManager::with_keychain_and_memory();
+
+    let (_, resp, _) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
+        .await
+        .expect("sisu");
+    println!("FM-XSTS: sisu ok, title={} user={}",
+             resp.title_token.token.len(), resp.user_token.token.len());
+    println!("FM-XSTS: sisu authorization_token uhs = {}",
+             resp.authorization_token.userhash());
+
+    for rp in ["http://xboxliveauth.forzamotorsport.net/", "http://xboxlive.com"] {
+        match get_xsts_token(None, Some(&resp.title_token), Some(&resp.user_token), rp).await {
+            Ok(x) => {
+                println!("FM-XSTS: {rp} -> uhs {} tokenlen {}", x.userhash(), x.token.len());
+                if rp.contains("forzamotorsport") {
+                    let hdr = format!("XBL3.0 x={};{}", x.userhash(), x.token);
+                    std::fs::write("/tmp/fm_title_xsts.txt", &hdr).expect("write");
+                    println!("FM-XSTS: header written to /tmp/fm_title_xsts.txt ({} chars)", hdr.len());
+                }
+            }
+            Err(e) => println!("FM-XSTS: {rp} -> FAILED {e:?}"),
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_forza_title_endpoints() {
+    use xal::extensions::SigningReqwestBuilder;
+
+    let client = reqwest::Client::new();
+    crate::secrets::init_secrets().expect("Unable to initialize credentials");
+    let tokens = TokenManager::with_keychain_and_memory();
+
+    // keep the authenticator — you threw it away as `_` before, and it holds the signer
+    let (auth, resp, _) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
+    .await
+    .expect("SISU failed");
+
+    println!("uhs        = {}", resp.authorization_token.userhash());
+    println!("xsts expiry= {}", resp.authorization_token.not_after);
+
+    let auth_header = resp.authorization_token.authorization_header_value();
+    let mut signer = auth.request_signer();
+
+    let response = client
+    .get("https://title.mgt.xboxlive.com/titles/current/endpoints")
+    .query(&[("type", "1")])
+    .header("Authorization", &auth_header)
+    .header("x-xbl-contract-version", "1")
+    .header("Accept", "application/json")
+    .sign(&mut signer, None)
+    .await
+    .expect("failed to sign request")
+    .send()
+    .await
+    .expect("request failed");
+
+    println!("STATUS: {}", response.status());
+    for (k, v) in response.headers() {
+        println!("  {k}: {v:?}");
+    }
+    println!("BODY:\n{}", response.text().await.unwrap_or_default());
+}
+
+/// The full chain, all on ONE authenticator so the proof key matches throughout:
+///   device token (XAD) + SISU title token (XAT) + user token (XAU)
+///     -> XSTS for Forza's relying party
+/// The previous attempt passed device=None and xsts.auth answered 400, which is
+/// its documented behaviour when a TitleToken arrives without a DeviceToken.
+/// Reusing do_sisu's returned authenticator matters: a fresh one generates a new
+/// proof key, and a device token bound to a different key is the same 400.
+#[ignore]
+#[tokio::test]
+async fn test_forza_xsts_full_chain() {
+    let client = reqwest::Client::new();
+    crate::secrets::init_secrets().expect("Unable to initialize credentials");
+    let tokens = TokenManager::with_keychain_and_memory();
+
+    let (mut auth, resp, _) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
+        .await
+        .expect("sisu");
+    println!("FM-FULL: sisu ok (title {} chars)", resp.title_token.token.len());
+
+    let xad = auth.get_device_token().await.expect("device token");
+    println!("FM-FULL: device token ok ({} chars)", xad.token.len());
+
+    for rp in ["http://xboxliveauth.forzamotorsport.net/", "http://xboxlive.com"] {
+        match auth
+            .get_xsts_token(Some(&xad), Some(&resp.title_token), Some(&resp.user_token), rp)
+            .await
+        {
+            Ok(x) => {
+                println!("FM-FULL: {rp}\n         uhs {}  tokenlen {}", x.userhash(), x.token.len());
+                if rp.contains("forzamotorsport") {
+                    let hdr = format!("XBL3.0 x={};{}", x.userhash(), x.token);
+                    std::fs::write("/tmp/fm_title_xsts.txt", &hdr).expect("write");
+                    println!("         header -> /tmp/fm_title_xsts.txt ({} chars)", hdr.len());
+                }
+            }
+            Err(e) => println!("FM-FULL: {rp} -> FAILED {e:?}"),
+        }
+    }
+}
+
+/// ONE DEVICE IDENTITY end to end.
+///
+/// The previous attempt paired SISU's title token with a device token minted
+/// separately by `get_device_token()`, whose identity is
+/// `XalAuthenticator::device_id = Uuid::new_v4()` - a different machine every
+/// instance - and xsts.auth answered
+/// `401 XSTS error="title_usage_by_device_exceeded"` (XErr 2148916254).
+///
+/// `do_sisu` already mints the right one via `get_device_token_rps` and then
+/// drops it on the floor. This uses THAT device token, so the device token, the
+/// title token bound to it, and the user token all describe one device.
+#[ignore]
+#[tokio::test]
+async fn test_forza_xsts_one_device() {
+    let client = reqwest::Client::new();
+    crate::secrets::init_secrets().expect("Unable to initialize credentials");
+    let tokens = TokenManager::with_keychain_and_memory();
+
+    let (mut auth, resp, device) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
+        .await
+        .expect("sisu");
+    println!("FM-ONE: sisu ok - title {} user {} device {} (the SISU device)",
+             resp.title_token.token.len(), resp.user_token.token.len(), device.token.len());
+
+    for rp in ["http://xboxliveauth.forzamotorsport.net/", "http://xboxlive.com"] {
+        match auth
+            .get_xsts_token(Some(&device), Some(&resp.title_token), Some(&resp.user_token), rp)
+            .await
+        {
+            Ok(x) => {
+                println!("FM-ONE: {rp}\n        uhs {}  tokenlen {}", x.userhash(), x.token.len());
+                let hdr = format!("XBL3.0 x={};{}", x.userhash(), x.token);
+                let path = if rp.contains("forzamotorsport") {
+                    "/tmp/fm_title_xsts.txt"
+                } else {
+                    // For title.mgt.xboxlive.com/titles/current/endpoints - the
+                    // TITLE-SCOPED discovery document, which needs title auth.
+                    "/tmp/fm_xbl_xsts.txt"
+                };
+                std::fs::write(path, &hdr).expect("write");
+                println!("        header -> {path} ({} chars)", hdr.len());
+            }
+            Err(e) => println!("FM-ONE: {rp} -> FAILED {e:?}"),
+        }
+    }
 }
