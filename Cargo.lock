@@ -6099,6 +6099,7 @@ dependencies = [
 [[package]]
 name = "xal"
 version = "0.1.3"
+source = "git+https://github.com/AllanVester/xal-rs?rev=231f7528cda1dee1aac09225d09fcd67d76980e0#231f7528cda1dee1aac09225d09fcd67d76980e0"
 dependencies = [
  "async-trait",
  "base64ct",
